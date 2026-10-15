@@ -1,0 +1,6 @@
+{
+  "name": "OmniPDF by Maodo - PDF & Document Suite",
+  "description": "Fast, private client-side PDF tools by Maodo: merge, split, convert between PDF, Word, Excel, Images, organize, compress, and rotate documents.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
