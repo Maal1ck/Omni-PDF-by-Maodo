@@ -78,6 +78,7 @@ export default function App() {
       <main className="flex-1">
         {selectedTool ? (
           <ToolWorkspace
+            key={selectedTool.id}
             tool={selectedTool}
             onBack={handleBackToHome}
             onSaveToHistory={handleSaveToHistory}

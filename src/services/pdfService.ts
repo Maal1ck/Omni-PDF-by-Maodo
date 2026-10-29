@@ -1,14 +1,22 @@
 import { PDFDocument, rgb, degrees, StandardFonts } from 'pdf-lib';
 import * as pdfjsLib from 'pdfjs-dist';
 import JSZip from 'jszip';
-import * as XLSX from 'xlsx';
-import { Document, Paragraph, TextRun, Packer, HeadingLevel, Table, TableRow, TableCell, WidthType } from 'docx';
+import ExcelJS from 'exceljs';
+import Papa from 'papaparse';
+import { Document, Paragraph, TextRun, Packer, HeadingLevel, Table, TableRow, TableCell, WidthType, ImageRun } from 'docx';
 import mammoth from 'mammoth';
+import { renderAsync as renderDocx } from 'docx-preview';
+import html2canvas from 'html2canvas';
+import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import { PdfEditAnnotation } from '../types';
 
 // Initialize PDF.js worker
 if (typeof window !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
-  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 }
+
+const pdfPageRenderTasks = new WeakMap<HTMLCanvasElement, pdfjsLib.RenderTask>();
+const pdfPageRenderTokens = new WeakMap<HTMLCanvasElement, number>();
 
 /** Helper to read File as ArrayBuffer */
 export async function fileToArrayBuffer(file: File): Promise<ArrayBuffer> {
@@ -67,6 +75,188 @@ export async function getPdfPageCount(file: File): Promise<number> {
   } catch {
     return 1;
   }
+}
+
+export async function renderPdfPageToCanvas(
+  file: File,
+  pageNumber: number,
+  canvas: HTMLCanvasElement
+): Promise<{ pageCount: number }> {
+  const token = (pdfPageRenderTokens.get(canvas) ?? 0) + 1;
+  pdfPageRenderTokens.set(canvas, token);
+  pdfPageRenderTasks.get(canvas)?.cancel();
+
+  const loadingTask = pdfjsLib.getDocument({ data: await file.arrayBuffer() });
+  const pdf = await loadingTask.promise;
+  try {
+    if (token !== pdfPageRenderTokens.get(canvas)) return { pageCount: pdf.numPages };
+    if (pageNumber < 1 || pageNumber > pdf.numPages) {
+      throw new Error(`Page ${pageNumber} is outside this PDF's page range.`);
+    }
+
+    const page = await pdf.getPage(pageNumber);
+    if (token !== pdfPageRenderTokens.get(canvas)) return { pageCount: pdf.numPages };
+    const baseViewport = page.getViewport({ scale: 1 });
+    const scale = Math.min(1.35, 760 / baseViewport.width);
+    const viewport = page.getViewport({ scale });
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('Your browser could not create a PDF preview canvas.');
+    const task = page.render({ canvasContext: context, viewport });
+    pdfPageRenderTasks.set(canvas, task);
+    try {
+      await task.promise;
+    } finally {
+      if (pdfPageRenderTasks.get(canvas) === task) pdfPageRenderTasks.delete(canvas);
+    }
+    return { pageCount: pdf.numPages };
+  } finally {
+    await pdf.destroy();
+  }
+}
+
+export function cancelPdfPageRender(canvas: HTMLCanvasElement): void {
+  pdfPageRenderTokens.set(canvas, (pdfPageRenderTokens.get(canvas) ?? 0) + 1);
+  pdfPageRenderTasks.get(canvas)?.cancel();
+  pdfPageRenderTasks.delete(canvas);
+}
+
+export async function editPdf(file: File, annotations: PdfEditAnnotation[]): Promise<Blob> {
+  const fileBytes = await file.arrayBuffer();
+  if (/\/ByteRange\s*\[/.test(new TextDecoder('latin1').decode(fileBytes))) {
+    throw new Error('This PDF already contains a digital signature. Editing it could invalidate that signature.');
+  }
+  const sourceDoc = await PDFDocument.load(fileBytes);
+  if (annotations.length === 0) throw new Error('Add text or a signature before exporting.');
+  if (annotations.some((annotation) => !Number.isInteger(annotation.pageIndex) || annotation.pageIndex < 0 || annotation.pageIndex >= sourceDoc.getPageCount())) {
+    throw new Error('An edit refers to a page that is not in this PDF.');
+  }
+  const outputDoc = await PDFDocument.create();
+  const pdfJsTask = pdfjsLib.getDocument({ data: fileBytes.slice(0) });
+  const pdfJsDoc = await pdfJsTask.promise;
+  const replacementPages = new Set(
+    annotations.filter((annotation) => annotation.kind === 'replace').map((annotation) => annotation.pageIndex)
+  );
+  const font = await outputDoc.embedFont(StandardFonts.Helvetica);
+  const italicFont = await outputDoc.embedFont(StandardFonts.HelveticaOblique);
+
+  for (let pageIndex = 0; pageIndex < sourceDoc.getPageCount(); pageIndex += 1) {
+    const pageAnnotations = annotations.filter((annotation) => annotation.pageIndex === pageIndex);
+    if (pageAnnotations.length === 0) {
+      const [copiedPage] = await outputDoc.copyPages(sourceDoc, [pageIndex]);
+      outputDoc.addPage(copiedPage);
+      continue;
+    }
+
+    if (replacementPages.has(pageIndex)) {
+      const renderedPage = await pdfJsDoc.getPage(pageIndex + 1);
+      const viewport = renderedPage.getViewport({ scale: 2 });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.ceil(viewport.width);
+      canvas.height = Math.ceil(viewport.height);
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('Your browser could not flatten the edited PDF page.');
+      await renderedPage.render({ canvasContext: context, viewport }).promise;
+
+      for (const annotation of pageAnnotations) {
+        const x = annotation.x * canvas.width;
+        const y = annotation.y * canvas.height;
+        if (annotation.kind === 'replace') {
+          const width = (annotation.width ?? 0) * canvas.width;
+          const height = (annotation.height ?? 0) * canvas.height;
+          context.fillStyle = '#ffffff';
+          context.fillRect(x, y, width, height);
+          context.fillStyle = '#141923';
+          context.font = `${Math.max(14, Math.min(32, height * 0.62))}px Arial, sans-serif`;
+          context.textBaseline = 'middle';
+          context.fillText(annotation.text ?? '', x + 5, y + height / 2, Math.max(1, width - 10));
+        } else if (annotation.kind === 'signature' && annotation.imageData) {
+          const image = new Image();
+          image.src = annotation.imageData;
+          await image.decode();
+          const width = Math.min(canvas.width * 0.32, 300);
+          const height = width * (image.height / image.width);
+          context.drawImage(image, x, y, width, height);
+        } else if (annotation.text) {
+          context.fillStyle = '#141923';
+          context.font = `${annotation.kind === 'signature' ? 'italic 28px' : '16px'} Arial, sans-serif`;
+          context.textBaseline = 'top';
+          context.fillText(annotation.text, x, y, canvas.width - x);
+        }
+      }
+
+      const imageBytes = Uint8Array.from(
+        atob(canvas.toDataURL('image/png').split(',')[1]),
+        (char) => char.charCodeAt(0)
+      );
+      const image = await outputDoc.embedPng(imageBytes);
+      const flattenedPage = outputDoc.addPage([viewport.width / 2, viewport.height / 2]);
+      flattenedPage.drawImage(image, {
+        x: 0,
+        y: 0,
+        width: flattenedPage.getWidth(),
+        height: flattenedPage.getHeight(),
+      });
+      canvas.width = 0;
+      canvas.height = 0;
+      continue;
+    }
+
+    const [page] = await outputDoc.copyPages(sourceDoc, [pageIndex]);
+    outputDoc.addPage(page);
+    for (const annotation of pageAnnotations) {
+      const x = annotation.x * page.getWidth();
+      const topY = (1 - annotation.y) * page.getHeight();
+      if (annotation.kind === 'signature' && annotation.imageData) {
+        const base64 = annotation.imageData.split(',')[1];
+        if (!base64) throw new Error('The signature image is not valid.');
+        const signatureBytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+        const image = await outputDoc.embedPng(signatureBytes);
+        const width = Math.min(150, page.getWidth() * 0.32);
+        const height = width * (image.height / image.width);
+        page.drawImage(image, {
+          x,
+          y: Math.max(0, topY - height),
+          width,
+          height,
+        });
+      } else if (annotation.text) {
+        page.drawText(annotation.text, {
+          x,
+          y: Math.max(0, topY - 16),
+          size: annotation.kind === 'signature' ? 22 : 12,
+          font: annotation.kind === 'signature' ? italicFont : font,
+          color: rgb(0.08, 0.1, 0.16),
+          maxWidth: page.getWidth() - x,
+        });
+      }
+    }
+  }
+
+  await pdfJsDoc.destroy();
+  return bytesToBlob(await outputDoc.save(), 'application/pdf');
+}
+
+export async function signPdfWithP12(
+  pdf: Blob,
+  certificate: Uint8Array,
+  passphrase: string,
+  signerName: string
+): Promise<Blob> {
+  if (!window.omniPdf?.signPdf) {
+    throw new Error('Certificate-based signing is available only in the installed desktop app.');
+  }
+  if (certificate.length === 0 || !passphrase || !signerName.trim()) {
+    throw new Error('Select your certificate, enter its password, and provide a signer name.');
+  }
+  const signedBytes = await window.omniPdf.signPdf(
+    new Uint8Array(await pdf.arrayBuffer()),
+    certificate,
+    passphrase,
+    signerName.trim()
+  );
+  return bytesToBlob(signedBytes, 'application/pdf');
 }
 
 /** Render all pages of a PDF to thumbnails */
@@ -447,7 +637,42 @@ export async function pdfToText(file: File): Promise<Blob> {
   return new Blob([fullText], { type: 'text/plain;charset=utf-8' });
 }
 
-export async function pdfToWord(file: File): Promise<Blob> {
+export async function pdfToWord(file: File, mode: 'visual' | 'editable' = 'editable'): Promise<Blob> {
+  if (mode === 'visual') {
+    const loadingTask = pdfjsLib.getDocument({ data: await file.arrayBuffer() });
+    const pdf = await loadingTask.promise;
+    const paragraphs: Paragraph[] = [];
+
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      const viewport = page.getViewport({ scale: 1.6 });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.ceil(viewport.width);
+      canvas.height = Math.ceil(viewport.height);
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('Your browser could not render a PDF page image.');
+      await page.render({ canvasContext: context, viewport }).promise;
+
+      const imageData = canvas.toDataURL('image/png').split(',')[1];
+      if (!imageData) throw new Error(`Could not create an image for page ${pageNumber}.`);
+      const imageBytes = Uint8Array.from(atob(imageData), (char) => char.charCodeAt(0));
+      const maxWidth = 624;
+      const maxHeight = 864;
+      const scale = Math.min(maxWidth / viewport.width, maxHeight / viewport.height);
+      const image = new ImageRun({
+        type: 'png',
+        data: imageBytes,
+        transformation: {
+          width: Math.round(viewport.width * scale),
+          height: Math.round(viewport.height * scale),
+        },
+      });
+      paragraphs.push(new Paragraph({ children: [image], pageBreakBefore: pageNumber > 1 }));
+    }
+
+    return Packer.toBlob(new Document({ sections: [{ children: paragraphs }] }));
+  }
+
   const pages = await extractPdfTextByPage(file);
   const docSectionsChildren: Paragraph[] = [];
 
@@ -496,35 +721,77 @@ export async function pdfToWord(file: File): Promise<Blob> {
 // 6. PDF TO EXCEL (.xlsx / .csv)
 // ----------------------------------------------------
 export async function pdfToExcel(file: File): Promise<Blob> {
-  const pages = await extractPdfTextByPage(file);
-  const wb = XLSX.utils.book_new();
-
+  const loadingTask = pdfjsLib.getDocument({ data: await file.arrayBuffer() });
+  const pdf = await loadingTask.promise;
+  const workbook = new ExcelJS.Workbook();
   let hasData = false;
-  pages.forEach((page, pIdx) => {
-    const rows: string[][] = [];
 
-    for (const line of page.lines) {
-      // Split on multiple spaces, tabs, or common delimiter characters
-      const cols = line.split(/\t|\s{2,}|(?<=[a-zA-Z0-9])\s*\|\s*/).map((s) => s.trim()).filter(Boolean);
-      if (cols.length > 0) {
-        rows.push(cols);
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber);
+    const content = await page.getTextContent();
+    const lines: Array<{ y: number; items: Array<{ x: number; width: number; text: string }> }> = [];
+
+    for (const item of content.items) {
+      if (!('str' in item) || !item.str.trim()) continue;
+      const y = item.transform[5];
+      let line = lines.find((candidate) => Math.abs(candidate.y - y) <= 3);
+      if (!line) {
+        line = { y, items: [] };
+        lines.push(line);
       }
+      line.items.push({ x: item.transform[4], width: item.width, text: item.str.trim() });
     }
 
-    if (rows.length > 0) {
+    const rows = lines
+      .sort((a, b) => b.y - a.y)
+      .map((line) => {
+        const sortedItems = line.items.sort((a, b) => a.x - b.x);
+        const cells: string[] = [];
+        let currentText = '';
+        let currentEnd = Number.NEGATIVE_INFINITY;
+
+        for (const item of sortedItems) {
+          const gap = item.x - currentEnd;
+          if (currentText && gap > 16) {
+            cells.push(currentText.trim());
+            currentText = item.text;
+          } else {
+            currentText = currentText ? `${currentText} ${item.text}` : item.text;
+          }
+          currentEnd = item.x + item.width;
+        }
+        if (currentText) cells.push(currentText.trim());
+        return cells;
+      })
+      .filter((row) => row.length > 0);
+
+    if (rows.length) {
       hasData = true;
-      const ws = XLSX.utils.aoa_to_sheet(rows);
-      XLSX.utils.book_append_sheet(wb, ws, `Page ${pIdx + 1}`);
+      const worksheet = workbook.addWorksheet(`Page ${pageNumber}`);
+      const columnCount = Math.max(...rows.map((row) => row.length));
+      worksheet.columns = Array.from({ length: columnCount }, (_, column) => ({
+        width: Math.min(42, Math.max(12, ...rows.map((row) => String(row[column] ?? '').length))),
+      }));
+      worksheet.addRows(rows);
+      worksheet.views = [{ state: 'frozen', ySplit: 1 }];
+      const header = worksheet.getRow(1);
+      header.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      header.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF334155' },
+      };
     }
-  });
+  }
+  await pdf.destroy();
 
   if (!hasData) {
-    const ws = XLSX.utils.aoa_to_sheet([['Extracted Text'], ['No tabular data detected in PDF']]);
-    XLSX.utils.book_append_sheet(wb, ws, 'Data');
+    const worksheet = workbook.addWorksheet('Data');
+    worksheet.addRows([['Extracted Text'], ['No tabular data detected in PDF']]);
   }
 
-  const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
-  return new Blob([wbout], {
+  const wbout = await workbook.xlsx.writeBuffer();
+  return new Blob([new Uint8Array(wbout)], {
     type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   });
 }
@@ -532,12 +799,95 @@ export async function pdfToExcel(file: File): Promise<Blob> {
 // ----------------------------------------------------
 // 7. WORD (.docx) TO PDF
 // ----------------------------------------------------
-export async function wordToPdf(file: File): Promise<Blob> {
+export async function wordToPdf(file: File, mode: 'visual' | 'editable' = 'editable'): Promise<Blob> {
   const arrayBuffer = await file.arrayBuffer();
-  const result = await mammoth.extractRawText({ arrayBuffer });
-  const rawText = result.value || 'Empty document';
+  if (mode === 'editable') {
+    const result = await mammoth.extractRawText({ arrayBuffer });
+    const rawText = result.value || 'Empty document';
+    return textToPdf(rawText, file.name.replace(/\.docx$/i, ''));
+  }
 
-  return await textToPdf(rawText, file.name.replace(/\.docx$/i, ''));
+  const body = document.createElement('div');
+  const styles = document.createElement('div');
+  Object.assign(body.style, {
+    position: 'fixed',
+    left: '-100000px',
+    top: '0',
+    zIndex: '-1',
+    background: '#fff',
+  });
+  document.body.append(styles, body);
+
+  try {
+    await renderDocx(arrayBuffer, body, styles, {
+      breakPages: true,
+      ignoreWidth: false,
+      ignoreHeight: false,
+      renderHeaders: true,
+      renderFooters: true,
+      useBase64URL: true,
+    });
+
+    const pageElements = Array.from(body.querySelectorAll<HTMLElement>('.docx'));
+    if (pageElements.length === 0) throw new Error('No pages could be rendered from this Word document.');
+
+    const pdfDoc = await PDFDocument.create();
+    for (let index = 0; index < pageElements.length; index += 1) {
+      const element = pageElements[index];
+      const pageWidth = element.offsetWidth;
+      const pageHeight = element.offsetHeight;
+      if (!pageWidth || !pageHeight) {
+        throw new Error(`Could not measure Word page ${index + 1} for conversion.`);
+      }
+
+      const canvas = await html2canvas(element, {
+        backgroundColor: '#ffffff',
+        scale: 2,
+        width: pageWidth,
+        height: pageHeight,
+        logging: false,
+        onclone: (clonedDocument) => {
+          const nodes = [clonedDocument.documentElement, clonedDocument.body, ...clonedDocument.querySelectorAll('*')];
+          const clonedWindow = clonedDocument.defaultView;
+          if (!clonedWindow) return;
+          for (const node of nodes) {
+            if (!(node instanceof clonedWindow.HTMLElement)) continue;
+            const computed = clonedWindow.getComputedStyle(node);
+            for (const property of [
+              'color',
+              'background-color',
+              'border-top-color',
+              'border-right-color',
+              'border-bottom-color',
+              'border-left-color',
+              'outline-color',
+              'text-decoration-color',
+            ]) {
+              if (computed.getPropertyValue(property).includes('oklch')) {
+                node.style.setProperty(property, property === 'color' ? '#000000' : '#ffffff', 'important');
+              }
+            }
+          }
+        },
+      });
+      const imageData = canvas.toDataURL('image/jpeg', 0.96).split(',')[1];
+      if (!imageData) throw new Error(`Could not render Word page ${index + 1}.`);
+      const imageBytes = Uint8Array.from(atob(imageData), (char) => char.charCodeAt(0));
+      const page = pdfDoc.addPage([pageWidth * 0.75, pageHeight * 0.75]);
+      const image = await pdfDoc.embedJpg(imageBytes);
+      page.drawImage(image, {
+        x: 0,
+        y: 0,
+        width: page.getWidth(),
+        height: page.getHeight(),
+      });
+    }
+
+    return bytesToBlob(await pdfDoc.save(), 'application/pdf');
+  } finally {
+    body.remove();
+    styles.remove();
+  }
 }
 
 export async function zipFiles(entries: Array<{ fileName: string; blob: Blob }>): Promise<Blob> {
@@ -555,95 +905,241 @@ export async function zipFiles(entries: Array<{ fileName: string; blob: Blob }>)
 // 8. EXCEL (.xlsx, .csv) TO PDF
 // ----------------------------------------------------
 export async function excelToPdf(file: File): Promise<Blob> {
-  const arrayBuffer = await file.arrayBuffer();
-  const wb = XLSX.read(arrayBuffer, { type: 'array' });
-  const sheetName = wb.SheetNames[0] || 'Sheet1';
-  const sheet = wb.Sheets[sheetName];
-  const rows: (string | number)[][] = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+  const workbook = new ExcelJS.Workbook();
+  if (/\.csv$/i.test(file.name)) {
+    const parsedCsv = Papa.parse<string[]>(await file.text(), { skipEmptyLines: true });
+    if (parsedCsv.errors.length > 0) {
+      throw new Error(`Could not parse CSV data: ${parsedCsv.errors[0].message}`);
+    }
+    workbook.addWorksheet(file.name.replace(/\.csv$/i, '') || 'CSV').addRows(parsedCsv.data);
+  } else {
+    await workbook.xlsx.load(await file.arrayBuffer());
+  }
+  if (workbook.worksheets.length === 0) throw new Error('The spreadsheet contains no worksheets.');
 
   const pdfDoc = await PDFDocument.create();
   const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
 
-  // Landscape A4 for tables: 841.89 x 595.28
   const pageWidth = 841.89;
   const pageHeight = 595.28;
   const margin = 40;
+  const contentWidth = pageWidth - margin * 2;
+  const fontSize = 8.5;
 
-  let currentPage = pdfDoc.addPage([pageWidth, pageHeight]);
-  let y = pageHeight - margin;
+  const wrapCell = (value: string, width: number): string[] => {
+    const words = value.split(/\s+/);
+    const lines: string[] = [];
+    let line = '';
+    for (const word of words) {
+      const fragments: string[] = [];
+      let fragment = '';
+      for (const character of word) {
+        if (fragment && font.widthOfTextAtSize(`${fragment}${character}`, fontSize) > width - 10) {
+          fragments.push(fragment);
+          fragment = character;
+        } else {
+          fragment += character;
+        }
+      }
+      if (fragment) fragments.push(fragment);
 
-  // Header Title
-  currentPage.drawText(`Spreadsheet Export: ${file.name} (${sheetName})`, {
-    x: margin,
-    y: y,
-    size: 14,
-    font: boldFont,
-    color: rgb(0.1, 0.15, 0.25),
-  });
-  y -= 30;
-
-  if (rows.length === 0) {
-    currentPage.drawText('Sheet contains no data.', { x: margin, y: y, size: 10, font });
-    const bytes = await pdfDoc.save();
-    return bytesToBlob(bytes, 'application/pdf');
-  }
-
-  // Calculate column widths
-  const maxCols = Math.min(8, Math.max(...rows.map((r) => r.length)));
-  const colWidth = (pageWidth - margin * 2) / maxCols;
-  const rowHeight = 22;
-
-  rows.forEach((row, rIdx) => {
-    if (y < margin + 30) {
-      currentPage = pdfDoc.addPage([pageWidth, pageHeight]);
-      y = pageHeight - margin;
+      for (const part of fragments) {
+        const candidate = line ? `${line} ${part}` : part;
+        if (line && font.widthOfTextAtSize(candidate, fontSize) > width - 10) {
+          lines.push(line);
+          line = part;
+        } else {
+          line = candidate;
+        }
+      }
     }
+    if (line) lines.push(line);
+    return lines.length ? lines : [''];
+  };
 
-    const isHeaderRow = rIdx === 0;
+  const getExcelColor = (argb?: string) => {
+    const hex = argb?.slice(-6);
+    if (!hex || !/^[0-9a-f]{6}$/i.test(hex)) return undefined;
+    return rgb(
+      parseInt(hex.slice(0, 2), 16) / 255,
+      parseInt(hex.slice(2, 4), 16) / 255,
+      parseInt(hex.slice(4, 6), 16) / 255
+    );
+  };
 
-    // Row background
-    if (isHeaderRow) {
-      currentPage.drawRectangle({
-        x: margin,
-        y: y - 5,
-        width: pageWidth - margin * 2,
-        height: rowHeight,
-        color: rgb(0.92, 0.94, 0.96),
+  for (const sheet of workbook.worksheets) {
+    const rows: Array<{ sourceRow: number; values: string[] }> = [];
+    sheet.eachRow({ includeEmpty: false }, (row) => {
+      if (row.number > 100000 || row.cellCount > 200) {
+        throw new Error(`Worksheet "${sheet.name}" exceeds the 100,000-row or 200-column conversion limit.`);
+      }
+      rows.push({
+        sourceRow: row.number,
+        values: Array.from({ length: Math.max(row.cellCount, sheet.columnCount) }, (_, index) =>
+          row.getCell(index + 1).text
+        ),
       });
-    } else if (rIdx % 2 === 1) {
-      currentPage.drawRectangle({
-        x: margin,
-        y: y - 5,
-        width: pageWidth - margin * 2,
-        height: rowHeight,
-        color: rgb(0.98, 0.99, 1.0),
-      });
-    }
-
-    for (let c = 0; c < maxCols; c++) {
-      const cellVal = row[c] !== undefined && row[c] !== null ? String(row[c]) : '';
-      const truncated = cellVal.length > 25 ? cellVal.substring(0, 22) + '...' : cellVal;
-
-      currentPage.drawText(truncated, {
-        x: margin + c * colWidth + 5,
-        y: y + 2,
-        size: isHeaderRow ? 9 : 8.5,
-        font: isHeaderRow ? boldFont : font,
-        color: isHeaderRow ? rgb(0.1, 0.15, 0.2) : rgb(0.2, 0.25, 0.3),
-      });
-    }
-
-    // Hairline divider
-    currentPage.drawLine({
-      start: { x: margin, y: y - 5 },
-      end: { x: pageWidth - margin, y: y - 5 },
-      thickness: 0.5,
-      color: rgb(0.85, 0.88, 0.9),
     });
 
-    y -= rowHeight;
-  });
+    const columnCount = Math.max(1, sheet.columnCount, ...rows.map((row) => row.values.length));
+    const weights = Array.from({ length: columnCount }, (_, column) => {
+      const longest = rows.reduce((max, row) => Math.max(max, row.values[column]?.length ?? 0), 8);
+      return Math.max(8, Math.min(34, sheet.getColumn(column + 1).width || longest));
+    });
+    const columnGroups: number[][] = [];
+    let currentGroup: number[] = [];
+    let groupWidth = 0;
+    for (let column = 0; column < columnCount; column += 1) {
+      const estimatedWidth = contentWidth * (weights[column] / weights.reduce((sum, width) => sum + width, 0));
+      if (currentGroup.length > 0 && (currentGroup.length >= 6 || groupWidth + estimatedWidth > contentWidth)) {
+        columnGroups.push(currentGroup);
+        currentGroup = [];
+        groupWidth = 0;
+      }
+      currentGroup.push(column);
+      groupWidth += estimatedWidth;
+    }
+    if (currentGroup.length) columnGroups.push(currentGroup);
+
+    for (const columns of columnGroups) {
+      const groupWeight = columns.reduce((sum, column) => sum + weights[column], 0);
+      const columnWidths = columns.map((column) => contentWidth * (weights[column] / groupWeight));
+      let page = pdfDoc.addPage([pageWidth, pageHeight]);
+      let y = pageHeight - margin;
+
+      const drawPageHeading = () => {
+        page.drawText(`${file.name} — ${sheet.name}`, {
+          x: margin,
+          y,
+          size: 13,
+          font: boldFont,
+          color: rgb(0.1, 0.15, 0.25),
+        });
+        y -= 24;
+        if (columnGroups.length > 1) {
+          page.drawText(`Columns ${columns[0] + 1}–${columns[columns.length - 1] + 1}`, {
+            x: margin,
+            y,
+            size: 8,
+            font,
+            color: rgb(0.35, 0.4, 0.48),
+          });
+          y -= 14;
+        }
+      };
+
+      const drawHeaderRow = () => {
+        if (rows.length === 0) return;
+        const values = columns.map((column) => rows[0]?.values[column] ?? '');
+        const wrapped = values.map((value, index) => wrapCell(value, columnWidths[index]));
+        const height = Math.max(20, ...wrapped.map((lines) => lines.length * (fontSize + 2) + 8));
+        page.drawRectangle({
+          x: margin,
+          y: y - height + 5,
+          width: contentWidth,
+          height,
+          color: rgb(0.9, 0.93, 0.97),
+        });
+        let x = margin;
+        wrapped.forEach((lines, index) => {
+          const sourceCell = sheet.getCell(rows[0].sourceRow, columns[index] + 1);
+          const fill = sourceCell.fill;
+          const fillColor = fill?.type === 'pattern' && fill.pattern === 'solid'
+            ? getExcelColor(fill.fgColor?.argb)
+            : undefined;
+          if (fillColor) {
+            page.drawRectangle({
+              x,
+              y: y - height + 5,
+              width: columnWidths[index],
+              height,
+              color: fillColor,
+            });
+          }
+          const textColor = getExcelColor(sourceCell.font?.color?.argb) ?? rgb(0.1, 0.15, 0.2);
+          lines.forEach((line, lineIndex) => {
+            page.drawText(line, {
+              x: x + 5,
+              y: y - 10 - lineIndex * (fontSize + 2),
+              size: fontSize,
+              font: sourceCell.font?.bold === false ? font : boldFont,
+              color: textColor,
+            });
+          });
+          x += columnWidths[index];
+        });
+        y -= height;
+      };
+
+      drawPageHeading();
+      if (rows.length === 0) {
+        page.drawText('Sheet contains no data.', { x: margin, y, size: 10, font });
+        continue;
+      }
+      drawHeaderRow();
+
+      for (let rowIndex = 1; rowIndex < rows.length; rowIndex += 1) {
+        const sourceRow = rows[rowIndex];
+        const values = columns.map((column) => sourceRow?.values[column] ?? '');
+        const wrapped = values.map((value, index) => wrapCell(value, columnWidths[index]));
+        const height = Math.max(17, ...wrapped.map((lines) => lines.length * (fontSize + 2) + 6));
+        if (y - height < margin) {
+          page = pdfDoc.addPage([pageWidth, pageHeight]);
+          y = pageHeight - margin;
+          drawPageHeading();
+          drawHeaderRow();
+        }
+
+        if (rowIndex % 2 === 0) {
+          page.drawRectangle({
+            x: margin,
+            y: y - height + 5,
+            width: contentWidth,
+            height,
+            color: rgb(0.98, 0.99, 1),
+          });
+        }
+
+        let x = margin;
+        wrapped.forEach((lines, index) => {
+          const sourceCell = sheet.getCell(sourceRow.sourceRow, columns[index] + 1);
+          const fill = sourceCell.fill;
+          const fillColor = fill?.type === 'pattern' && fill.pattern === 'solid'
+            ? getExcelColor(fill.fgColor?.argb)
+            : undefined;
+          if (fillColor) {
+            page.drawRectangle({
+              x,
+              y: y - height + 5,
+              width: columnWidths[index],
+              height,
+              color: fillColor,
+            });
+          }
+          const textColor = getExcelColor(sourceCell.font?.color?.argb) ?? rgb(0.2, 0.25, 0.3);
+          lines.forEach((line, lineIndex) => {
+            page.drawText(line, {
+              x: x + 5,
+              y: y - 10 - lineIndex * (fontSize + 2),
+              size: fontSize,
+              font: sourceCell.font?.bold || sourceCell.font?.italic ? boldFont : font,
+              color: textColor,
+            });
+          });
+          x += columnWidths[index];
+        });
+
+        page.drawLine({
+          start: { x: margin, y: y - height + 5 },
+          end: { x: pageWidth - margin, y: y - height + 5 },
+          thickness: 0.5,
+          color: rgb(0.85, 0.88, 0.9),
+        });
+        y -= height;
+      }
+    }
+  }
 
   const bytes = await pdfDoc.save();
   return bytesToBlob(bytes, 'application/pdf');

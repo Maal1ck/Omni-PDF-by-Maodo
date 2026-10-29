@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#e11d48"/>
+      <stop offset="100%" stop-color="#be123c"/>
+    </linearGradient>
+    <linearGradient id="fold" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fda4af"/>
+      <stop offset="100%" stop-color="#f43f5e"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="16" stdDeviation="24" flood-color="#000000" flood-opacity="0.25"/>
+    </filter>
+  </defs>
+
+  <!-- Background rounded squircle -->
+  <rect width="512" height="512" rx="128" fill="#0f172a"/>
+  
+  <!-- Document Sheet -->
+  <g filter="url(#shadow)">
+    <!-- Main page body -->
+    <path d="M128 88 H312 L400 176 V424 H128 Z" fill="url(#bg)" rx="16"/>
+    <!-- Folded corner -->
+    <path d="M312 88 V176 H400 Z" fill="url(#fold)"/>
+  </g>
+
+  <!-- Checkmark / Pulse icon -->
+  <path d="M200 280 L240 320 L320 220" fill="none" stroke="#ffffff" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  
+  <!-- Text PDF -->
+  <text x="256" y="388" font-family="system-ui, -apple-system, sans-serif" font-size="44" font-weight="900" fill="#ffffff" text-anchor="middle" letter-spacing="4">PDF</text>
+</svg>

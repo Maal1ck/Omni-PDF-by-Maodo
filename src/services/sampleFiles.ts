@@ -1,5 +1,5 @@
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
-import * as XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
 import { Document, Paragraph, TextRun, Packer, HeadingLevel } from 'docx';
 
 export async function createSamplePdf(title: string = 'Invoice_Report_2026.pdf', pages: number = 3): Promise<File> {
@@ -128,8 +128,8 @@ export async function createSampleDocx(title: string = 'Quarterly_Strategy_Draft
   });
 }
 
-export function createSampleXlsx(title: string = 'Financial_Q3_Spreadsheet.xlsx'): File {
-  const wb = XLSX.utils.book_new();
+export async function createSampleXlsx(title: string = 'Financial_Q3_Spreadsheet.xlsx'): Promise<File> {
+  const wb = new ExcelJS.Workbook();
   const data = [
     ['Quarter', 'Department', 'Budget (USD)', 'Actual (USD)', 'Variance (%)'],
     ['Q1', 'Engineering', 450000, 428000, '+4.8%'],
@@ -141,10 +141,20 @@ export function createSampleXlsx(title: string = 'Financial_Q3_Spreadsheet.xlsx'
     ['Total', 'Consolidated', 1135000, 1108000, '+2.4%'],
   ];
 
-  const ws = XLSX.utils.aoa_to_sheet(data);
-  XLSX.utils.book_append_sheet(wb, ws, 'Financial Summary');
-  const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
-  return new File([wbout], title, {
+  const ws = wb.addWorksheet('Financial Summary');
+  ws.addRows(data);
+  ws.columns = [
+    { width: 14 },
+    { width: 24 },
+    { width: 18 },
+    { width: 18 },
+    { width: 16 },
+  ];
+  ws.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF334155' } };
+  ws.getRow(8).font = { bold: true };
+  const wbout = await wb.xlsx.writeBuffer();
+  return new File([new Uint8Array(wbout)], title, {
     type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   });
 }

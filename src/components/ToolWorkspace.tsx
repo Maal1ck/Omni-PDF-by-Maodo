@@ -24,8 +24,9 @@ import {
   ChevronRight,
   ShieldCheck,
 } from 'lucide-react';
-import { ToolDefinition, FileItem, PageThumb, ProcessResult, ProcessHistoryItem } from '../types';
+import { ToolDefinition, FileItem, PageThumb, ProcessResult, ProcessHistoryItem, PdfEditAnnotation } from '../types';
 import { ToolIcon } from './ToolIcon';
+import { PdfEditor, PdfSigningSettings } from './PdfEditor';
 import {
   mergePdfs,
   splitPdf,
@@ -43,6 +44,8 @@ import {
   watermarkPdf,
   addPageNumbersPdf,
   compressPdf,
+  editPdf,
+  signPdfWithP12,
   getPdfPageCount,
   renderAllPdfPageThumbnails,
   renderPdfPageThumbnail,
@@ -116,6 +119,14 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({
   // 8. Compress
   const [compressLevel, setCompressLevel] = useState<'recommended' | 'extreme' | 'low'>('recommended');
   const [compressedStats, setCompressedStats] = useState<{ original: number; compressed: number } | null>(null);
+  const [pdfAnnotations, setPdfAnnotations] = useState<PdfEditAnnotation[]>([]);
+  const [pdfSigningSettings, setPdfSigningSettings] = useState<PdfSigningSettings>({
+    enabled: false,
+    certificate: null,
+    passphrase: '',
+    signerName: '',
+  });
+  const [conversionMode, setConversionMode] = useState<'visual' | 'editable'>('visual');
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
@@ -170,6 +181,15 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({
     setError(null);
     setResult(null);
     setPdfRenderedImages([]);
+    if (tool.id === 'edit-pdf') {
+      setPdfAnnotations([]);
+      setPdfSigningSettings({
+        enabled: false,
+        certificate: null,
+        passphrase: '',
+        signerName: '',
+      });
+    }
 
     const fileArray = Array.from(newFileList);
     if (fileArray.length === 0) return;
@@ -217,7 +237,7 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({
     if (tool.id === 'word-to-pdf') {
       sampleFile = await createSampleDocx();
     } else if (tool.id === 'excel-to-pdf') {
-      sampleFile = createSampleXlsx();
+      sampleFile = await createSampleXlsx();
     } else if (tool.id === 'text-to-pdf') {
       sampleFile = createSampleText();
     } else if (tool.id === 'jpg-to-pdf') {
@@ -355,6 +375,32 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({
           break;
         }
 
+        case 'edit-pdf': {
+          setProcessingStatus('Applying text and signature overlays...');
+          outputBlob = pdfAnnotations.length > 0
+            ? await editPdf(files[0].file, pdfAnnotations)
+            : files[0].file;
+          if (pdfSigningSettings.enabled) {
+            if (!pdfSigningSettings.certificate) {
+              throw new Error('Select your PKCS#12 certificate before signing.');
+            }
+            setProcessingStatus('Applying your certificate-based digital signature...');
+            outputBlob = await signPdfWithP12(
+              outputBlob,
+              pdfSigningSettings.certificate,
+              pdfSigningSettings.passphrase,
+              pdfSigningSettings.signerName
+            );
+          } else if (pdfAnnotations.length === 0) {
+            throw new Error('Add text or a signature, or enable certificate-based signing.');
+          }
+          outputName = `${pdfSigningSettings.enabled ? 'signed_' : 'edited_'}${files[0].name}`;
+          details = pdfSigningSettings.enabled
+            ? 'Added your text/signature marks and certificate-based digital signature.'
+            : 'Added your text/signature marks to the PDF.';
+          break;
+        }
+
         case 'jpg-to-pdf': {
           setProcessingStatus(`Converting ${files.length} images to PDF...`);
           outputBlob = await imagesToPdf(files.map((f) => f.file), {
@@ -404,16 +450,18 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({
           if (files.length > 1) {
             const converted = await Promise.all(files.map(async (item) => ({
               fileName: `${item.name.replace(/\.docx$/i, '')}.pdf`,
-              blob: await wordToPdf(item.file),
+              blob: await wordToPdf(item.file, conversionMode),
             })));
             outputBlob = await zipFiles(converted);
             outputName = 'word_to_pdf_batch.zip';
-            details = `Converted ${files.length} Word documents into a ZIP archive`;
+            details = `Converted ${files.length} Word documents to PDFs (${conversionMode === 'visual' ? 'visual fidelity mode' : 'editable text mode'})`;
             break;
           }
-          outputBlob = await wordToPdf(files[0].file);
+          outputBlob = await wordToPdf(files[0].file, conversionMode);
           outputName = `${files[0].name.replace(/\.docx$/i, '')}.pdf`;
-          details = 'Converted Microsoft Word document to standard PDF';
+          details = conversionMode === 'visual'
+            ? 'Rendered Word pages to preserve layout and formatting; PDF pages are image-based.'
+            : 'Converted Word text to selectable PDF text; page layout may differ from Word.';
           break;
         }
 
@@ -422,16 +470,18 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({
           if (files.length > 1) {
             const converted = await Promise.all(files.map(async (item) => ({
               fileName: `${item.name.replace(/\.pdf$/i, '')}.docx`,
-              blob: await pdfToWord(item.file),
+              blob: await pdfToWord(item.file, conversionMode),
             })));
             outputBlob = await zipFiles(converted);
             outputName = 'pdf_to_word_batch.zip';
-            details = `Converted ${files.length} PDFs into a ZIP archive of DOCX files`;
+            details = `Converted ${files.length} PDFs to Word (${conversionMode === 'visual' ? 'page image mode' : 'editable text mode'})`;
             break;
           }
-          outputBlob = await pdfToWord(files[0].file);
+          outputBlob = await pdfToWord(files[0].file, conversionMode);
           outputName = `${files[0].name.replace(/\.pdf$/i, '')}.docx`;
-          details = 'Created editable Microsoft Word (.docx) document';
+          details = conversionMode === 'visual'
+            ? 'Placed each PDF page as an image to preserve its appearance; page text is not editable.'
+            : 'Created an editable Word document from extracted PDF text; layout may differ from the original.';
           break;
         }
 
@@ -810,6 +860,16 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({
               </div>
             )}
 
+            {tool.id === 'edit-pdf' && files[0] && (
+              <PdfEditor
+                file={files[0].file}
+                annotations={pdfAnnotations}
+                onAnnotationsChange={setPdfAnnotations}
+                signingSettings={pdfSigningSettings}
+                onSigningSettingsChange={setPdfSigningSettings}
+              />
+            )}
+
             {/* Organize Tool Specific Visual Grid */}
             {tool.id === 'organize' && files.length > 0 && (
               <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 shadow-2xs">
@@ -1043,6 +1103,42 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({
               </div>
 
               {/* Tool-specific configuration controls */}
+              {(tool.id === 'word-to-pdf' || tool.id === 'pdf-to-word') && (
+                <div className="mb-5 space-y-3">
+                  <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
+                    Conversion output
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {([
+                      { id: 'visual', label: 'Match appearance' },
+                      { id: 'editable', label: 'Editable text' },
+                    ] as const).map((mode) => (
+                      <button
+                        key={mode.id}
+                        type="button"
+                        onClick={() => setConversionMode(mode.id)}
+                        className={`rounded-lg border px-2 py-2 text-[11px] font-semibold ${
+                          conversionMode === mode.id
+                            ? 'border-rose-400 bg-rose-50 text-rose-700 dark:border-rose-700 dark:bg-rose-950/50 dark:text-rose-300'
+                            : 'border-slate-200 text-slate-600 dark:border-slate-700 dark:text-slate-400'
+                        }`}
+                      >
+                        {mode.label}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+                    {tool.id === 'word-to-pdf'
+                      ? conversionMode === 'visual'
+                        ? 'Uses rendered Word pages for closer layout, font, and image matching. PDF pages are images, so text is not selectable.'
+                        : 'Keeps extracted text selectable, but does not preserve the original Word page layout.'
+                      : conversionMode === 'visual'
+                        ? 'Places each PDF page as an image in Word. Appearance is retained, but page content is not editable.'
+                        : 'Extracts text into editable Word paragraphs; columns, spacing, and graphics may not match the PDF.'}
+                  </p>
+                </div>
+              )}
+
               {/* 1. SPLIT PDF */}
               {tool.id === 'split' && (
                 <div className="space-y-4">
@@ -1446,10 +1542,10 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({
                 <div className="p-3 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-xl text-xs text-slate-600 dark:text-slate-300 space-y-1.5">
                   <div className="font-semibold text-slate-900 dark:text-white flex items-center gap-1.5">
                     <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
-                    <span>Native High-Fidelity Converter</span>
+                    <span>Local document conversion</span>
                   </div>
                   <p className="text-[11px] leading-relaxed">
-                    Preserves structure, font styles, and tabular cell data directly in your browser.
+                    Files stay in your browser. Layout matching depends on source formatting, available fonts, and whether the document is scanned.
                   </p>
                 </div>
               )}

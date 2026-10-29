@@ -157,6 +157,18 @@ export const TOOLS_LIST: ToolDefinition[] = [
 
   // 4. Edit & Security
   {
+    id: 'edit-pdf',
+    title: 'Edit & Sign PDF',
+    shortDesc: 'Add text and handwritten signatures, or digitally sign with your certificate in the desktop app.',
+    category: 'edit-security',
+    acceptTypes: '.pdf,application/pdf',
+    acceptLabel: 'PDF file',
+    multiple: false,
+    color: 'from-indigo-500 to-violet-700',
+    iconName: 'FileSignature',
+    badge: 'New',
+  },
+  {
     id: 'watermark',
     title: 'Watermark PDF',
     shortDesc: 'Stamp text or custom watermarks across pages with customizable opacity and position.',

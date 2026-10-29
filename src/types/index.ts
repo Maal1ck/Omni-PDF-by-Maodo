@@ -14,6 +14,7 @@ export type ToolId =
   | 'pdf-to-word'
   | 'pdf-to-excel'
   | 'pdf-to-text'
+  | 'edit-pdf'
   | 'watermark'
   | 'page-numbers';
 
@@ -48,6 +49,18 @@ export interface PageThumb {
   thumbnailUrl: string;
   rotation: number; // 0, 90, 180, 270
   isDeleted?: boolean;
+}
+
+export interface PdfEditAnnotation {
+  id: string;
+  pageIndex: number;
+  x: number;
+  y: number;
+  kind: 'text' | 'signature' | 'replace';
+  text?: string;
+  imageData?: string;
+  width?: number;
+  height?: number;
 }
 
 export interface ProcessResult {
