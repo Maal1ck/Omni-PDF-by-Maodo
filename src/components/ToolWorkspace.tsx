@@ -100,6 +100,7 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({
   const [pagesList, setPagesList] = useState<PageThumb[]>([]);
   const [isLoadingPages, setIsLoadingPages] = useState(false);
   const [draggedPageIndex, setDraggedPageIndex] = useState<number | null>(null);
+  const organizeLoadId = useRef(0);
 
   // 5. Watermark
   const [watermarkText, setWatermarkText] = useState('CONFIDENTIAL');
@@ -142,10 +143,15 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({
   useEffect(() => {
     if (tool.id === 'organize' && files.length > 0) {
       loadOrganizePages(files.map((f) => f.file));
+    } else if (tool.id === 'organize') {
+      organizeLoadId.current += 1;
+      setPagesList([]);
+      setIsLoadingPages(false);
     }
   }, [files, tool.id]);
 
   const loadOrganizePages = async (selectedFiles: File[]) => {
+    const loadId = ++organizeLoadId.current;
     setIsLoadingPages(true);
     try {
       const thumbs: PageThumb[] = [];
@@ -169,11 +175,14 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({
         });
       }
 
-      setPagesList(thumbs);
-    } catch (e) {
-      console.error(e);
+      if (loadId === organizeLoadId.current) setPagesList(thumbs);
+    } catch (cause) {
+      if (loadId === organizeLoadId.current) {
+        setPagesList([]);
+        setError(cause instanceof Error ? cause.message : 'Could not load PDF page previews.');
+      }
     } finally {
-      setIsLoadingPages(false);
+      if (loadId === organizeLoadId.current) setIsLoadingPages(false);
     }
   };
 
@@ -331,6 +340,9 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({
           details = splitRes.isZip
             ? 'Pages extracted into archive'
             : `Selected pages extracted into ${outputName}`;
+          if (splitRes.flattened) {
+            details += '. The output was rasterized to preserve page appearance, so text is not selectable.';
+          }
           break;
         }
 
@@ -349,10 +361,14 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({
             throw new Error('At least one page must remain in the document.');
           }
 
-          outputBlob = await organizePdfFiles(files.map((f) => f.file), actions);
+          const organized = await organizePdfFiles(files.map((f) => f.file), actions);
+          outputBlob = organized.blob;
           outputName = files.length > 1 ? 'organized_multiple_pdfs.pdf' : `organized_${files[0].name}`;
           const keptCount = actions.length;
           details = `Exported ${keptCount} pages with custom layout across ${files.length} PDF${files.length > 1 ? 's' : ''}`;
+          if (organized.flattened) {
+            details += '. The output was rasterized to preserve page appearance, so text is not selectable.';
+          }
           break;
         }
 
@@ -1554,7 +1570,7 @@ export const ToolWorkspace: React.FC<ToolWorkspaceProps> = ({
               <div className="mt-6 pt-4 border-t border-slate-100 dark:border-slate-800">
                 <button
                   onClick={handleExecuteTool}
-                  disabled={files.length === 0 || isProcessing}
+                  disabled={files.length === 0 || isProcessing || (tool.id === 'organize' && isLoadingPages)}
                   className="w-full py-3.5 text-sm font-bold text-white bg-gradient-to-r from-rose-600 to-red-600 hover:from-rose-500 hover:to-red-500 disabled:from-slate-300 disabled:to-slate-300 dark:disabled:from-slate-800 dark:disabled:to-slate-800 dark:disabled:text-slate-500 disabled:cursor-not-allowed rounded-xl shadow-md shadow-rose-600/20 hover:shadow-lg transition-all flex items-center justify-center gap-2 cursor-pointer"
                 >
                   {isProcessing ? (

@@ -317,7 +317,10 @@ export interface SplitOptions {
   extractAsZip?: boolean;
 }
 
-export async function splitPdf(file: File, options: SplitOptions): Promise<{ blob: Blob; fileName: string; isZip: boolean }> {
+async function splitPdfWithPdfLib(
+  file: File,
+  options: SplitOptions
+): Promise<{ blob: Blob; fileName: string; isZip: boolean }> {
   const buffer = await file.arrayBuffer();
   const srcDoc = await PDFDocument.load(buffer, { ignoreEncryption: true });
   const totalPages = srcDoc.getPageCount();
@@ -423,6 +426,110 @@ export async function splitPdf(file: File, options: SplitOptions): Promise<{ blo
     fileName: `${baseName}_split.pdf`,
     isZip: false,
   };
+}
+
+function isMissingPdfDictionaryError(cause: unknown): cause is Error {
+  return cause instanceof Error &&
+    cause.message === 'Expected instance of PDFDict, but got instance of undefined';
+}
+
+async function splitPdfWithPdfJs(
+  file: File,
+  options: SplitOptions
+): Promise<{ blob: Blob; fileName: string; isZip: boolean; flattened: true }> {
+  const loadingTask = pdfjsLib.getDocument({ data: await file.arrayBuffer() });
+  const sourcePdf = await loadingTask.promise;
+  const baseName = file.name.replace(/\.pdf$/i, '');
+
+  const renderPages = (pageIndices: number[]) =>
+    rasterizePdfPageActions(
+      [sourcePdf],
+      pageIndices.map((originalIndex) => ({ originalIndex, rotation: 0, isDeleted: false }))
+    );
+
+  const parseRange = (part: string): number[] => {
+    const pageIndices: number[] = [];
+    if (part.includes('-')) {
+      const [start, end] = part.split('-').map((n) => parseInt(n.trim(), 10));
+      if (!isNaN(start) && !isNaN(end)) {
+        const firstPage = Math.max(1, Math.min(start, end));
+        const lastPage = Math.min(sourcePdf.numPages, Math.max(start, end));
+        for (let page = firstPage; page <= lastPage; page += 1) pageIndices.push(page - 1);
+      }
+    } else {
+      const pageNumber = parseInt(part, 10);
+      if (!isNaN(pageNumber) && pageNumber >= 1 && pageNumber <= sourcePdf.numPages) {
+        pageIndices.push(pageNumber - 1);
+      }
+    }
+    return pageIndices;
+  };
+
+  try {
+    if (options.mode === 'extract_all') {
+      const zip = new JSZip();
+      for (let pageIndex = 0; pageIndex < sourcePdf.numPages; pageIndex += 1) {
+        zip.file(`${baseName}_page_${pageIndex + 1}.pdf`, await renderPages([pageIndex]));
+      }
+      return {
+        blob: await zip.generateAsync({ type: 'blob' }),
+        fileName: `${baseName}_all_pages.zip`,
+        isZip: true,
+        flattened: true,
+      };
+    }
+
+    const ranges = (options.rangeString || '1').trim().split(',').map((part) => part.trim()).filter(Boolean);
+    if (ranges.length === 0) {
+      throw new Error('Please specify at least one page or page range (e.g., 1-2, 4)');
+    }
+
+    if (options.extractAsZip && ranges.length > 1) {
+      const zip = new JSZip();
+      for (let rangeIndex = 0; rangeIndex < ranges.length; rangeIndex += 1) {
+        const part = ranges[rangeIndex];
+        const pageIndices = parseRange(part);
+        if (pageIndices.length > 0) {
+          zip.file(
+            `${baseName}_part_${rangeIndex + 1}_pages_${part}.pdf`,
+            await renderPages(pageIndices)
+          );
+        }
+      }
+      return {
+        blob: await zip.generateAsync({ type: 'blob' }),
+        fileName: `${baseName}_split_ranges.zip`,
+        isZip: true,
+        flattened: true,
+      };
+    }
+
+    const pageIndices = Array.from(new Set(ranges.flatMap(parseRange)));
+    if (pageIndices.length === 0) {
+      throw new Error(`No valid pages matched within the document (Total pages: ${sourcePdf.numPages})`);
+    }
+
+    return {
+      blob: await renderPages(pageIndices),
+      fileName: `${baseName}_split.pdf`,
+      isZip: false,
+      flattened: true,
+    };
+  } finally {
+    await sourcePdf.destroy();
+  }
+}
+
+export async function splitPdf(
+  file: File,
+  options: SplitOptions
+): Promise<{ blob: Blob; fileName: string; isZip: boolean; flattened?: boolean }> {
+  try {
+    return await splitPdfWithPdfLib(file, options);
+  } catch (cause) {
+    if (!isMissingPdfDictionaryError(cause)) throw cause;
+    return splitPdfWithPdfJs(file, options);
+  }
 }
 
 // ----------------------------------------------------
@@ -847,6 +954,8 @@ export async function wordToPdf(file: File, mode: 'visual' | 'editable' = 'edita
         height: pageHeight,
         logging: false,
         onclone: (clonedDocument) => {
+          clonedDocument.documentElement.style.setProperty('background-color', '#ffffff', 'important');
+          clonedDocument.body.style.setProperty('background-color', '#ffffff', 'important');
           const nodes = [clonedDocument.documentElement, clonedDocument.body, ...clonedDocument.querySelectorAll('*')];
           const clonedWindow = clonedDocument.defaultView;
           if (!clonedWindow) return;
@@ -1255,38 +1364,115 @@ export interface PageAction {
 }
 
 export async function organizePdf(file: File, pageActions: PageAction[]): Promise<Blob> {
-  return organizePdfFiles([file], pageActions);
+  const result = await organizePdfFiles([file], pageActions);
+  return result.blob;
 }
 
-export async function organizePdfFiles(files: File[], pageActions: PageAction[]): Promise<Blob> {
-  const sourceDocs = await Promise.all(
-    files.map(async (file) => PDFDocument.load(await file.arrayBuffer(), { ignoreEncryption: true }))
-  );
+async function rasterizePdfPageActions(
+  sourcePdfs: pdfjsLib.PDFDocumentProxy[],
+  pageActions: PageAction[]
+): Promise<Blob> {
+  const outputDoc = await PDFDocument.create();
+  for (const action of pageActions) {
+    const sourceIndex = action.sourceFileIndex ?? 0;
+    const sourcePdf = sourcePdfs[sourceIndex];
+    if (!sourcePdf) {
+      throw new Error(`Source PDF at index ${sourceIndex} was not found.`);
+    }
+    if (!Number.isInteger(action.originalIndex) || action.originalIndex < 0 || action.originalIndex >= sourcePdf.numPages) {
+      throw new Error(`Invalid page index ${action.originalIndex} for source PDF ${sourceIndex + 1}.`);
+    }
 
-  const newDoc = await PDFDocument.create();
+    const sourcePage = await sourcePdf.getPage(action.originalIndex + 1);
+    const rotation = (sourcePage.rotate + action.rotation + 360) % 360;
+    const viewport = sourcePage.getViewport({ scale: 2, rotation });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('Your browser could not create a canvas to organize this PDF.');
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    await sourcePage.render({ canvasContext: context, viewport }).promise;
+
+    const imageData = canvas.toDataURL('image/png').split(',')[1];
+    if (!imageData) throw new Error(`Could not render source PDF page ${action.originalIndex + 1}.`);
+    const imageBytes = Uint8Array.from(atob(imageData), (char) => char.charCodeAt(0));
+    const image = await outputDoc.embedPng(imageBytes);
+    const outputPage = outputDoc.addPage([viewport.width / 2, viewport.height / 2]);
+    outputPage.drawImage(image, {
+      x: 0,
+      y: 0,
+      width: outputPage.getWidth(),
+      height: outputPage.getHeight(),
+    });
+    canvas.width = 0;
+    canvas.height = 0;
+  }
+
+  return bytesToBlob(await outputDoc.save(), 'application/pdf');
+}
+
+async function rasterizeOrganizedPdfFiles(files: File[], pageActions: PageAction[]): Promise<Blob> {
+  const sourcePdfs: pdfjsLib.PDFDocumentProxy[] = [];
+  try {
+    for (const file of files) {
+      const loadingTask = pdfjsLib.getDocument({ data: await file.arrayBuffer() });
+      sourcePdfs.push(await loadingTask.promise);
+    }
+    return await rasterizePdfPageActions(sourcePdfs, pageActions);
+  } finally {
+    await Promise.all(sourcePdfs.map((sourcePdf) => sourcePdf.destroy()));
+  }
+}
+
+export async function organizePdfFiles(
+  files: File[],
+  pageActions: PageAction[]
+): Promise<{ blob: Blob; flattened: boolean }> {
+  if (files.length === 0) {
+    throw new Error('Add at least one PDF before organizing pages.');
+  }
+
   const validActions = pageActions.filter((a) => !a.isDeleted);
-
   if (validActions.length === 0) {
     throw new Error('At least one page must remain in the document.');
   }
 
-  for (const action of validActions) {
-    const sourceIndex = action.sourceFileIndex ?? 0;
-    const sourceDoc = sourceDocs[sourceIndex];
-    if (!sourceDoc) {
-      throw new Error(`Source PDF at index ${sourceIndex} was not found.`);
+  try {
+    const sourceDocs = await Promise.all(
+      files.map(async (file) => PDFDocument.load(await file.arrayBuffer(), { ignoreEncryption: true }))
+    );
+    const newDoc = await PDFDocument.create();
+
+    for (const action of validActions) {
+      const sourceIndex = action.sourceFileIndex ?? 0;
+      const sourceDoc = sourceDocs[sourceIndex];
+      if (!sourceDoc) {
+        throw new Error(`Source PDF at index ${sourceIndex} was not found.`);
+      }
+      if (!Number.isInteger(action.originalIndex) || action.originalIndex < 0 || action.originalIndex >= sourceDoc.getPageCount()) {
+        throw new Error(`Invalid page index ${action.originalIndex} for source PDF ${sourceIndex + 1}.`);
+      }
+
+      const [copiedPage] = await newDoc.copyPages(sourceDoc, [action.originalIndex]);
+      if (action.rotation) {
+        const cur = copiedPage.getRotation().angle;
+        copiedPage.setRotation(degrees((cur + action.rotation) % 360));
+      }
+      newDoc.addPage(copiedPage);
     }
 
-    const [copiedPage] = await newDoc.copyPages(sourceDoc, [action.originalIndex]);
-    if (action.rotation) {
-      const cur = copiedPage.getRotation().angle;
-      copiedPage.setRotation(degrees((cur + action.rotation) % 360));
-    }
-    newDoc.addPage(copiedPage);
+    const bytes = await newDoc.save();
+    return { blob: bytesToBlob(bytes, 'application/pdf'), flattened: false };
+  } catch (cause) {
+    if (!isMissingPdfDictionaryError(cause)) throw cause;
+
+    return {
+      blob: await rasterizeOrganizedPdfFiles(files, validActions),
+      flattened: true,
+    };
   }
-
-  const bytes = await newDoc.save();
-  return bytesToBlob(bytes, 'application/pdf');
 }
 
 // ----------------------------------------------------
